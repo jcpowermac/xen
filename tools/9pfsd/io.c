@@ -40,6 +40,8 @@
 #define P9_CMD_WRITE      118
 #define P9_CMD_CLUNK      120
 #define P9_CMD_STAT       124
+#define P9_CMD_READDIR    40   /* 9P2000(.L) TREADDIR; handled by p9_read */
+#define P9_CMD_FLUSH      108  /* TFLUSH; answer with empty RFLUSH */
 
 /* P9 protocol open flags. */
 #define P9_OREAD            0   /* read */
@@ -290,8 +292,13 @@ static void vfill_buffer_at(void **data, const char *fmt, va_list ap)
         case 's':
             stat = par;
             elem_sz = sizeof(*stat);
-            tlen = stat->size + sizeof(stat->size);
-            fill_buffer_at(data, "uuuUQUUULSSSSSUUU", &tlen, &stat->size,
+            /*
+             * The 9P stat record begins with its size field; there is no
+             * separate total-length prefix.  A leading extra u16 shifts the
+             * guest's sequential p9stat_read() by two bytes and breaks
+             * directory reads (RREAD of stat records).
+             */
+            fill_buffer_at(data, "uuUQUUULSSSSSUUU", &stat->size,
                            &stat->type, &stat->dev, &stat->qid, &stat->mode,
                            &stat->atime, &stat->mtime, &stat->length,
                            stat->name, stat->uid, stat->gid, stat->muid,
@@ -732,8 +739,19 @@ static void p9_version(struct ring *ring, struct p9_header *hdr)
         ring->max_size = max_size;
 
     version = ring->str + off;
-    if ( strcmp(version, P9_VERSION) )
+    /*
+     * Accept all 9P2000 variants but always negotiate down to the
+     * protocol we actually implement (9P2000.u). Linux guests default
+     * to 9P2000.L and adapt to the version string we return; if we
+     * echo "9P2000.L" they use .L extensions (TGETATTR, TLOPEN, ...) which
+     * this server does not handle and reply ENOTSUP to.
+     */
+    if ( strcmp(version, P9_VERSION) &&
+         strcmp(version, "9P2000.L") &&
+         strcmp(version, "9P2000") )
         version = "unknown";
+    else
+        version = P9_VERSION;
 
     fill_buffer(ring, hdr->cmd + 1, hdr->tag, "US", &ring->max_size, version);
 }
@@ -1148,6 +1166,17 @@ static void p9_create(struct ring *ring, struct p9_header *hdr)
     if ( fstatat(device->root_fd, fidp->path, &st, 0) < 0 )
         goto err;
 
+    /*
+     * The daemon runs as one uid (root), but guests see files through the
+     * numeric stat uids.  Attribute new files/dirs to the share root's
+     * owner so guest users that own the share can rewrite their own files.
+     */
+    {
+        struct stat rootst;
+        if ( fstatat(device->root_fd, ".", &rootst, 0) == 0 )
+            fchown(fidp->fd, rootst.st_uid, rootst.st_gid);
+    }
+
     fill_qid(device, fidp->path, &qid, &st);
     iounit = get_iounit(ring, &st);
     fidp->opened = true;
@@ -1222,15 +1251,22 @@ static void fill_p9_stat(device *device, struct p9_stat *p9s, struct stat *st,
     p9s->gid = "";
     p9s->muid = "";
     p9s->extension = "";
-    p9s->n_uid = 0;
-    p9s->n_gid = 0;
-    p9s->n_muid = 0;
+    /*
+     * Linux guests in access=user mode enforce permissions from the
+     * numeric uid/gid in the stat; reporting 0/0 makes everything look
+     * root-owned and breaks non-root users.
+     */
+    p9s->n_uid = (uint32_t)st->st_uid;
+    p9s->n_gid = (uint32_t)st->st_gid;
+    p9s->n_muid = (uint32_t)st->st_uid;
 
     /*
-     * Size of individual fields without the size field, including 5 2-byte
-     * string length fields.
+     * Size of everything after the size field itself:
+     *   type(2) dev(4) qid(13) mode(4) atime(4) mtime(4) length(8)
+     *   + 5 x (u16 string len) + 3 x u32 (n_uid/n_gid/n_muid) + name
+     * = 39 + 10 + 12 + strlen(name) = 61 + strlen(name)
      */
-    p9s->size = 71 + strlen(p9s->name);
+    p9s->size = 61 + strlen(p9s->name);
 }
 
 static void p9_stat(struct ring *ring, struct p9_header *hdr)
@@ -1261,9 +1297,22 @@ static void p9_stat(struct ring *ring, struct p9_header *hdr)
         p9_error(ring, hdr->tag, errno);
         goto out;
     }
-    fill_p9_stat(device, &p9s, &st, strrchr(fidp->path, '/') + 1);
+    {
+        const char *slash = strrchr(fidp->path, '/');
+        fill_p9_stat(device, &p9s, &st, slash ? slash + 1 : fidp->path);
+    }
 
-    fill_buffer(ring, hdr->cmd + 1, hdr->tag, "s", &p9s);
+    /*
+     * The Linux client parses RSTAT as "wS": a leading u16 (which it
+     * ignores) followed by a full p9_wstat.  RREAD directory records, by
+     * contrast, are parsed as a bare wstat (p9stat_read, "S").  So the
+     * RSTAT reply needs the extra size prefix that the 's' serializer
+     * (shared with RREAD) does not emit.
+     */
+    {
+        uint16_t prefix = 2 + p9s.size; /* total wstat size; guest ignores it */
+        fill_buffer(ring, hdr->cmd + 1, hdr->tag, "us", &prefix, &p9s);
+    }
 
  out:
     free_fid(device, fidp);
@@ -1495,6 +1544,14 @@ void *io_thread(void *arg)
 
             case P9_CMD_STAT:
                 p9_stat(ring, &hdr);
+                break;
+
+            case P9_CMD_READDIR:
+                p9_read(ring, &hdr);
+                break;
+
+            case P9_CMD_FLUSH:
+                fill_buffer(ring, P9_CMD_FLUSH + 1, hdr.tag, "");
                 break;
 
             default:
