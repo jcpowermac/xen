@@ -596,6 +596,12 @@ static void scan_backend(void)
 
         snprintf(dom_path, sizeof(dom_path), "backend/xen_9pfs/%lu", domid);
         devices = xs_directory(xs, XBT_NULL, dom_path, &n_devs);
+        if ( !devices )
+        {
+            /* Transient: domain backend being created/destroyed. */
+            n_devs = 0;
+            continue;
+        }
 
         for ( dev = 0; dev < n_devs; dev++ )
         {
@@ -764,7 +770,7 @@ int main(int argc, char *argv[])
     umask(027);
     if ( getenv("XEN_9PFSD_VERBOSE") )
         syslog_mask |= LOG_MASK(LOG_NOTICE) | LOG_MASK(LOG_INFO);
-    openlog("xen-9pfsd", LOG_CONS, LOG_DAEMON);
+    openlog("xen-9pfsd", LOG_CONS | LOG_PERROR, LOG_DAEMON);
     setlogmask(syslog_mask);
 
     sigemptyset(&act.sa_mask);

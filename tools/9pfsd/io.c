@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <xen-barrier.h>
@@ -42,6 +43,17 @@
 #define P9_CMD_STAT       124
 #define P9_CMD_READDIR    40   /* 9P2000(.L) TREADDIR; handled by p9_read */
 #define P9_CMD_FLUSH      108  /* TFLUSH; answer with empty RFLUSH */
+/* 9P2000.u / 9P2000.L extension commands. */
+#define P9_CMD_STATFS     8
+#define P9_CMD_LOPEN      12
+#define P9_CMD_SYMLINK    16
+#define P9_CMD_RENAME     20
+#define P9_CMD_FSYNC      50
+#define P9_CMD_MKDIR      72
+#define P9_CMD_RENAMEAT   74
+#define P9_CMD_UNLINKAT   76
+#define P9_CMD_REMOVE     122  /* TREMOVE; fid-based unlink/rmdir */
+#define P9_CMD_TWSTAT     126  /* TWSTAT; setattr / fsync / same-dir rename */
 
 /* P9 protocol open flags. */
 #define P9_OREAD            0   /* read */
@@ -50,12 +62,19 @@
 #define P9_OMODEMASK     0x03
 #define P9_OTRUNC        0x10   /* or'ed in, truncate file first */
 #define P9_OREMOVE       0x40   /* or'ed in, remove file after clunk */
+#define P9_OAPPEND       0x80   /* or'ed in, seek to end on write */
+#define P9_OEXCL         0x1000 /* or'ed in, exclusive (fail if exists) */
 
 /* P9 protocol create permission masks. */
 #define P9_CREATE_PERM_DIR        0x80000000
+#define P9_CREATE_PERM_SYMLINK    0x02000000
 #define P9_CREATE_PERM_NOTSUPP    0x03b00000   /* link, symlink, ... */
 #define P9_CREATE_PERM_DIR_MASK   0777
 #define P9_CREATE_PERM_FILE_MASK  0666
+#define P9_CREATE_PERM_SYMLINK_MASK 0777
+
+/* A 9P stat field set to this value means "leave attribute unchanged". */
+#define P9_WSTAT_INVALID    0xffffffffu
 
 #define P9_MIN_MSIZE      2048
 #define P9_VERSION        "9P2000.u"
@@ -440,6 +459,7 @@ static int fill_data(struct ring *ring, const char *fmt, ...)
     unsigned int str_off;
     unsigned int array_sz = 0;
     void **array = NULL;
+    struct p9_qid *qidp;
 
     va_start(ap, fmt);
 
@@ -496,6 +516,18 @@ static int fill_data(struct ring *ring, const char *fmt, ...)
             data += sizeof(uint64_t);
             break;
 
+        case 'Q':
+            qidp = par;
+            if ( !chk_data(ring, data, 1 + sizeof(uint32_t) + sizeof(uint64_t)) )
+                goto out;
+            qidp->type = get_unaligned((const uint8_t *)data);
+            data += sizeof(uint8_t);
+            qidp->version = get_unaligned((const uint32_t *)data);
+            data += sizeof(uint32_t);
+            qidp->path = get_unaligned((const uint64_t *)data);
+            data += sizeof(uint64_t);
+            break;
+
         case 'S':
             if ( !chk_data(ring, data, sizeof(uint16_t)) )
                 goto out;
@@ -519,6 +551,15 @@ static int fill_data(struct ring *ring, const char *fmt, ...)
                                  data) )
                 goto out;
             data += sizeof(uint32_t);
+            break;
+
+        case 'u':
+            if ( !chk_data(ring, data, sizeof(uint16_t)) )
+                goto out;
+            if ( !fill_data_elem(&par, array, &array_sz, sizeof(uint16_t),
+                                 data) )
+                goto out;
+            data += sizeof(uint16_t);
             break;
 
         default:
@@ -579,6 +620,8 @@ static struct p9_fid *alloc_fid_mem(device *device, unsigned int fid,
     return fidp;
 }
 
+static int alloc_debug = 1;
+
 static struct p9_fid *alloc_fid(device *device, unsigned int fid,
                                 const char *path)
 {
@@ -588,8 +631,35 @@ static struct p9_fid *alloc_fid(device *device, unsigned int fid,
 
     if ( find_fid(device, fid) )
     {
-        errno = EBADF;
-        goto out;
+        /*
+         * The guest can drop a fid from its own table without clunking
+         * (p9_fid_destroy on a failed walk), leaving a stale fid here with
+         * no active reference.  Reclaim it so the guest's next use of the
+         * same fid number does not fail with EBADF.  Only safe when nothing
+         * holds a reference (ref == 1).  A genuinely busy fid still yields
+         * EBADF.
+         */
+        struct p9_fid *stale = find_fid(device, fid);
+        if ( stale->ref == 1 )
+        {
+            if ( alloc_debug )
+                fprintf(stderr, "ALLOCFID fid=%u RECLAIM stale path='%s'\n",
+                        fid, stale->path);
+            if ( stale->opened )
+                close(stale->fd);
+            XEN_TAILQ_REMOVE(&device->fids, stale, list);
+            device->n_fids--;
+            free(stale);
+        }
+        else
+        {
+            if ( alloc_debug )
+                fprintf(stderr, "ALLOCFID fid=%u BUSY ref=%d path='%s' n_fids=%u/%u\n",
+                        fid, stale->ref, stale->path,
+                        device->n_fids, device->max_open_files);
+            errno = EBADF;
+            goto out;
+        }
     }
 
     if ( device->n_fids >= device->max_open_files )
@@ -702,6 +772,10 @@ static void p9_error(struct ring *ring, uint16_t tag, uint32_t err)
      * one it is that the underlying C library offers, when really we
      * don't expect this function to be called very often.
      */
+    fprintf(stderr, "RERROR %u.%u tag=%u errno=%u (%s)\n",
+            ring->device->domid, ring->device->devid, tag, err, strerror(err));
+    syslog(LOG_INFO, "RERROR %u.%u tag=%u errno=%u (%s)\n",
+           ring->device->domid, ring->device->devid, tag, err, strerror(err));
     pthread_mutex_lock(&mutex);
     str = strerror(err);
     len = min(strlen(str), (size_t)(MAX_ERRSTR_LEN - 1));
@@ -950,6 +1024,17 @@ static int open_flags_from_mode(uint8_t mode)
     if ( mode & P9_OTRUNC )
         flags |= O_TRUNC;
 
+    if ( mode & P9_OAPPEND )
+        flags |= O_APPEND;
+
+    if ( mode & P9_OEXCL )
+        flags |= O_EXCL;
+
+    /*
+     * P9_OREXEC (close-on-exec) and P9_ORCLOSE (remove-on-close) have no
+     * portable host equivalent; drop them rather than failing the open.
+     */
+
     return flags;
 }
 
@@ -976,7 +1061,9 @@ static void p9_open(struct ring *ring, struct p9_header *hdr)
         p9_error(ring, hdr->tag, EINVAL);
         return;
     }
-    if ( mode & ~(P9_OMODEMASK | P9_OTRUNC | P9_OREMOVE) )
+    /* 9p2000.u TOPEN mode bits we understand: access mode, OTRUNC,
+     * OREMOVE, OAPPEND.  OAPPEND is honoured by open_flags_from_mode(). */
+    if ( mode & ~(P9_OMODEMASK | P9_OTRUNC | P9_OREMOVE | P9_OAPPEND) )
     {
         p9_error(ring, hdr->tag, EINVAL);
         return;
@@ -1069,7 +1156,6 @@ static void p9_create(struct ring *ring, struct p9_header *hdr)
         p9_error(ring, hdr->tag, EINVAL);
         return;
     }
-
     if ( !name_ok(ring->str + name_off) )
     {
         p9_error(ring, hdr->tag, ENOENT);
@@ -1139,6 +1225,26 @@ static void p9_create(struct ring *ring, struct p9_header *hdr)
             goto err;
         fidp->data = fdopendir(fidp->fd);
         if ( !fidp->data )
+            goto err;
+    }
+    else if ( perm & P9_CREATE_PERM_SYMLINK )
+    {
+        const char *target = (ext_off != ~0u) ? ring->str + ext_off : ".";
+
+        perm &= P9_CREATE_PERM_SYMLINK_MASK;
+
+        XEN_TAILQ_REMOVE(&device->fids, fidp, list);
+        XEN_TAILQ_INSERT_HEAD(&device->fids, new_fidp, list);
+        free(fidp);
+        fidp = new_fidp;
+        new_fidp = NULL;
+
+        if ( symlinkat(target, device->root_fd, fidp->path) < 0 )
+            goto err;
+
+        /* A dangling symlink is still valid; don't require the target. */
+        fidp->fd = openat(device->root_fd, fidp->path, O_RDONLY);
+        if ( fidp->fd < 0 && errno != ENOENT )
             goto err;
     }
     else
@@ -1455,6 +1561,655 @@ static void p9_write(struct ring *ring, struct p9_header *hdr)
     free_fid(device, fidp);
 }
 
+/*
+ * Build "<parent-of-path>/<newname>" for a same-directory rename.
+ * Returns a malloc'd string, or NULL on allocation failure.
+ */
+static char *p9_sibling_path(const char *path, const char *newname)
+{
+    const char *slash = strrchr(path, '/');
+    size_t dirlen;
+    char *result;
+
+    if ( !slash )
+        dirlen = 0;                       /* top-level: parent is the root */
+    else
+        dirlen = (size_t)(slash - path);
+
+    if ( dirlen == 0 )
+        return strdup(newname);
+
+    result = malloc(dirlen + 1 + strlen(newname) + 1);
+    if ( !result )
+        return NULL;
+    memcpy(result, path, dirlen);
+    result[dirlen] = '/';
+    strcpy(result + dirlen + 1, newname);
+    return result;
+}
+
+/*
+ * Reply with a qid (and, if requested, an iounit) for path, stat'ing it.
+ * Returns 0 on success, errno on failure.
+ */
+static int p9_qid_reply(struct ring *ring, struct p9_header *hdr,
+                        uint8_t rcmd, const char *path, bool with_iounit)
+{
+    device *device = ring->device;
+    struct p9_qid qid;
+    uint32_t iounit = 0;
+    struct stat st;
+    int err;
+
+    err = fill_qid(device, path, &qid, NULL);
+    if ( err )
+        goto err;
+    if ( fstatat(device->root_fd, path, &st, 0) < 0 )
+    {
+        err = errno;
+        goto err;
+    }
+    iounit = get_iounit(ring, &st);
+
+    if ( with_iounit )
+        fill_buffer(ring, rcmd, hdr->tag, "QU", &qid, &iounit);
+    else
+        fill_buffer(ring, rcmd, hdr->tag, "Q", &qid);
+    return 0;
+
+ err:
+    p9_error(ring, hdr->tag, err);
+    return err;
+}
+
+/*
+ * TWSTAT (126): setattr, fsync, and same-directory rename for 9P2000.u.
+ *
+ * The guest sends a fid plus a stat.  Fields left at P9_WSTAT_INVALID
+ * (0xffffffff) mean "unchanged"; an fsync sends an entirely blank stat.
+ * A non-empty name performs a rename within the fid's directory.
+ */
+static void p9_twstat(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t fid;
+    uint16_t wsize, size, type;
+    uint32_t dev, mode, atime, mtime, n_uid, n_gid, n_muid;
+    uint64_t length;
+    struct p9_qid qid;
+    unsigned int name_off, uid_off, gid_off, muid_off, ext_off;
+    struct p9_fid *fidp;
+    struct stat st;
+    int ret;
+    int e = 0;
+
+    ret = fill_data(ring, "UuuuUQUUULSSSSSUUU", &fid, &wsize, &size, &type,
+                    &dev, &qid, &mode, &atime, &mtime, &length, &name_off,
+                    &uid_off, &gid_off, &muid_off, &ext_off, &n_uid, &n_gid,
+                    &n_muid);
+    if ( ret != 18 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    fidp = get_fid_ref(device, fid);
+    if ( !fidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    if ( fstatat(device->root_fd, fidp->path, &st, 0) < 0 )
+    {
+        e = errno;
+        goto out;
+    }
+
+    pthread_mutex_lock(&device->fid_mutex);
+
+    /* Rename (same directory) when a name is supplied. */
+    if ( name_off != ~0u && ring->str[name_off] )
+    {
+        char *newpath = p9_sibling_path(fidp->path, ring->str + name_off);
+        if ( !newpath )
+            e = ENOMEM;
+        else if ( strlen(newpath) > strlen(fidp->path) )
+        {
+            /* fidp->path buffer is sized to the original path length. */
+            e = ENAMETOOLONG;
+            free(newpath);
+        }
+        else if ( renameat(device->root_fd, fidp->path,
+                           device->root_fd, newpath) < 0 )
+        {
+            e = errno;
+            free(newpath);
+        }
+        else
+        {
+            strcpy(fidp->path, newpath);
+            free(newpath);
+        }
+        if ( e )
+            goto out_unlock;
+    }
+
+    if ( mode != P9_WSTAT_INVALID &&
+         fchmodat(device->root_fd, fidp->path, mode & 07777, 0) < 0 )
+    {
+        e = errno;
+        goto out_unlock;
+    }
+
+    if ( n_uid != P9_WSTAT_INVALID || n_gid != P9_WSTAT_INVALID )
+    {
+        uid_t uid = (n_uid == P9_WSTAT_INVALID) ? (uid_t)-1 : (uid_t)n_uid;
+        gid_t gid = (n_gid == P9_WSTAT_INVALID) ? (gid_t)-1 : (gid_t)n_gid;
+        if ( fchownat(device->root_fd, fidp->path, uid, gid, 0) < 0 )
+        {
+            e = errno;
+            goto out_unlock;
+        }
+    }
+
+    if ( length != (uint64_t)~0 )
+    {
+        int fd = openat(device->root_fd, fidp->path, O_RDWR);
+        if ( fd < 0 )
+            e = errno;
+        else if ( ftruncate(fd, (off_t)length) < 0 )
+            e = errno;
+        else
+            e = 0;
+        close(fd);
+        if ( e )
+            goto out_unlock;
+    }
+
+    if ( mtime != P9_WSTAT_INVALID || atime != P9_WSTAT_INVALID )
+    {
+        struct timespec ts[2];
+        ts[0].tv_sec = (atime == P9_WSTAT_INVALID) ? 0 : (time_t)atime;
+        ts[0].tv_nsec = (atime == P9_WSTAT_INVALID) ? UTIME_OMIT : 0;
+        ts[1].tv_sec = (mtime == P9_WSTAT_INVALID) ? 0 : (time_t)mtime;
+        ts[1].tv_nsec = (mtime == P9_WSTAT_INVALID) ? UTIME_OMIT : 0;
+        if ( utimensat(device->root_fd, fidp->path, ts, 0) < 0 )
+        {
+            e = errno;
+            goto out_unlock;
+        }
+    }
+
+out_unlock:
+    pthread_mutex_unlock(&device->fid_mutex);
+out:
+    if ( e )
+        p9_error(ring, hdr->tag, e);
+    else
+        fill_buffer(ring, P9_CMD_TWSTAT + 1, hdr->tag, "");
+    free_fid(device, fidp);
+}
+
+/*
+ * TREMOVE (122): fid-based unlink/rmdir (the 9P2000.u unlink path).
+ */
+static void p9_remove(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t fid;
+    struct p9_fid *fidp;
+    struct stat st;
+    int ret;
+    int e;
+
+    ret = fill_data(ring, "U", &fid);
+    if ( ret != 1 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    fidp = get_fid_ref(device, fid);
+    if ( !fidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    if ( fstatat(device->root_fd, fidp->path, &st, 0) < 0 )
+        e = errno;
+    else
+        e = (unlinkat(device->root_fd, fidp->path,
+                      S_ISDIR(st.st_mode) ? AT_REMOVEDIR : 0) < 0) ? errno : 0;
+
+    free_fid(device, fidp);
+
+    if ( e )
+        p9_error(ring, hdr->tag, e);
+    else
+        fill_buffer(ring, P9_CMD_REMOVE + 1, hdr->tag, "");
+}
+
+/*
+ * TMKDIR (72): create a directory under fid's path.  Reply with a qid.
+ */
+static void p9_mkdir(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t fid, gid;
+    unsigned int name_off;
+    uint32_t perm;
+    struct p9_fid *fidp;
+    char *path;
+    int ret;
+
+    ret = fill_data(ring, "USUU", &fid, &name_off, &perm, &gid);
+    if ( ret != 4 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+    if ( !name_ok(ring->str + name_off) )
+    {
+        p9_error(ring, hdr->tag, ENOENT);
+        return;
+    }
+
+    fidp = get_fid_ref(device, fid);
+    if ( !fidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    path = malloc(strlen(fidp->path) + strlen(ring->str + name_off) + 2);
+    if ( !path )
+    {
+        free_fid(device, fidp);
+        p9_error(ring, hdr->tag, ENOMEM);
+        return;
+    }
+    sprintf(path, "%s/%s", fidp->path, ring->str + name_off);
+
+    if ( mkdirat(device->root_fd, path, perm & P9_CREATE_PERM_DIR_MASK) < 0 )
+    {
+        int e = errno;
+        free(path);
+        free_fid(device, fidp);
+        p9_error(ring, hdr->tag, e);
+        return;
+    }
+
+    p9_qid_reply(ring, hdr, P9_CMD_MKDIR + 1, path, false);
+    free(path);
+    free_fid(device, fidp);
+}
+
+/*
+ * TRENAME (20): move fid to newdirfid/<name>.  Reply empty (ROK).
+ */
+static void p9_rename(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t ofid, dfid;
+    unsigned int name_off;
+    struct p9_fid *ofidp, *dfidp;
+    char *newpath;
+    int ret;
+    int e;
+
+    ret = fill_data(ring, "UUS", &ofid, &dfid, &name_off);
+    if ( ret != 3 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    ofidp = get_fid_ref(device, ofid);
+    if ( !ofidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+    dfidp = get_fid_ref(device, dfid);
+    if ( !dfidp )
+    {
+        free_fid(device, ofidp);
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    newpath = malloc(strlen(dfidp->path) + strlen(ring->str + name_off) + 2);
+    if ( !newpath )
+        e = ENOMEM;
+    else
+    {
+        sprintf(newpath, "%s/%s", dfidp->path, ring->str + name_off);
+        e = (renameat(device->root_fd, ofidp->path,
+                      device->root_fd, newpath) < 0) ? errno : 0;
+        if ( !e )
+            strcpy(ofidp->path, newpath);
+        free(newpath);
+    }
+
+    free_fid(device, dfidp);
+    free_fid(device, ofidp);
+
+    if ( e )
+        p9_error(ring, hdr->tag, e);
+    else
+        fill_buffer(ring, P9_CMD_RENAME + 1, hdr->tag, "");
+}
+
+/*
+ * TRENAMEAT (74): rename olddirfid/<oldname> to newdirfid/<newname>.
+ */
+static void p9_renameat(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t ofid, dfid;
+    unsigned int oname_off, nname_off;
+    struct p9_fid *ofidp, *dfidp;
+    char *oldpath, *newpath;
+    int ret;
+    int e;
+
+    ret = fill_data(ring, "USSUS", &ofid, &oname_off, &dfid, &nname_off);
+    if ( ret != 5 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    ofidp = get_fid_ref(device, ofid);
+    if ( !ofidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+    dfidp = get_fid_ref(device, dfid);
+    if ( !dfidp )
+    {
+        free_fid(device, ofidp);
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    oldpath = malloc(strlen(ofidp->path) + strlen(ring->str + oname_off) + 2);
+    newpath = malloc(strlen(dfidp->path) + strlen(ring->str + nname_off) + 2);
+    if ( !oldpath || !newpath )
+        e = ENOMEM;
+    else
+    {
+        sprintf(oldpath, "%s/%s", ofidp->path, ring->str + oname_off);
+        sprintf(newpath, "%s/%s", dfidp->path, ring->str + nname_off);
+        e = (renameat(device->root_fd, oldpath,
+                      device->root_fd, newpath) < 0) ? errno : 0;
+    }
+    free(oldpath);
+    free(newpath);
+    free_fid(device, dfidp);
+    free_fid(device, ofidp);
+
+    if ( e )
+        p9_error(ring, hdr->tag, e);
+    else
+        fill_buffer(ring, P9_CMD_RENAMEAT + 1, hdr->tag, "");
+}
+
+/*
+ * TUNLINKAT (76): unlink dfid/<name>; flags bit 0 (AT_REMOVEDIR) rmdirs.
+ */
+static void p9_unlinkat(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t fid, flags;
+    unsigned int name_off;
+    struct p9_fid *fidp;
+    char *path;
+    int ret;
+    int e;
+
+    ret = fill_data(ring, "USU", &fid, &name_off, &flags);
+    if ( ret != 3 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    fidp = get_fid_ref(device, fid);
+    if ( !fidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    path = malloc(strlen(fidp->path) + strlen(ring->str + name_off) + 2);
+    if ( !path )
+        e = ENOMEM;
+    else
+    {
+        sprintf(path, "%s/%s", fidp->path, ring->str + name_off);
+        e = (unlinkat(device->root_fd, path,
+                      (flags & 1) ? AT_REMOVEDIR : 0) < 0) ? errno : 0;
+        free(path);
+    }
+
+    free_fid(device, fidp);
+
+    if ( e )
+        p9_error(ring, hdr->tag, e);
+    else
+        fill_buffer(ring, P9_CMD_UNLINKAT + 1, hdr->tag, "");
+}
+
+/*
+ * TSYMLINK (16): create dfid/<name> as a symlink to symtgt.  Reply qid.
+ */
+static void p9_symlink_op(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t fid, gid;
+    unsigned int name_off, tgt_off;
+    struct p9_fid *fidp;
+    char *path;
+    int ret;
+    int e;
+
+    ret = fill_data(ring, "USSU", &fid, &name_off, &tgt_off, &gid);
+    if ( ret != 4 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    fidp = get_fid_ref(device, fid);
+    if ( !fidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    path = malloc(strlen(fidp->path) + strlen(ring->str + name_off) + 2);
+    if ( !path )
+    {
+        e = ENOMEM;
+    }
+    else if ( sprintf(path, "%s/%s", fidp->path, ring->str + name_off) < 0 ||
+              symlinkat(ring->str + tgt_off, device->root_fd, path) < 0 )
+    {
+        e = errno;
+    }
+    else
+    {
+        /* p9_qid_reply sends the response (success or error) itself. */
+        p9_qid_reply(ring, hdr, P9_CMD_SYMLINK + 1, path, false);
+        free(path);
+        free_fid(device, fidp);
+        return;
+    }
+
+    free(path);
+    free_fid(device, fidp);
+    p9_error(ring, hdr->tag, e);
+}
+
+/*
+ * TSTATFS (8): filesystem statistics for the fid's path.
+ */
+static void p9_statfs(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t fid;
+    struct p9_fid *fidp;
+    struct statfs sfs;
+    int ret;
+    int fd, e;
+
+    ret = fill_data(ring, "U", &fid);
+    if ( ret != 1 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    fidp = get_fid_ref(device, fid);
+    if ( !fidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    fd = openat(device->root_fd, fidp->path, O_RDONLY);
+    if ( fd < 0 )
+        e = errno;
+    else if ( fstatfs(fd, &sfs) < 0 )
+        e = errno;
+    else
+    {
+        uint32_t bsize = sfs.f_bsize;
+        uint64_t blocks = sfs.f_blocks;
+        uint64_t bfree = sfs.f_bfree;
+        uint64_t bavail = sfs.f_bavail;
+        uint64_t files = sfs.f_files;
+        uint64_t ffree = sfs.f_ffree;
+        uint64_t fsid = ((uint64_t)sfs.f_fsid.__val[0] << 32) |
+                        (uint64_t)sfs.f_fsid.__val[1];
+        uint32_t namelen = sfs.f_namelen;
+        close(fd);
+        fill_buffer(ring, P9_CMD_STATFS + 1, hdr->tag,
+                    "UULLLLLLLU", &sfs.f_type, &bsize, &blocks, &bfree,
+                    &bavail, &files, &ffree, &fsid, &namelen);
+        free_fid(device, fidp);
+        return;
+    }
+    close(fd);
+
+    free_fid(device, fidp);
+    p9_error(ring, hdr->tag, e);
+}
+
+/*
+ * TFSYNC (50): fsync/fdatasync the fid's open file.  Reply empty (ROK).
+ */
+static void p9_fsync(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t fid, datasync;
+    struct p9_fid *fidp;
+    int ret;
+    int e;
+
+    ret = fill_data(ring, "UU", &fid, &datasync);
+    if ( ret != 2 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    fidp = get_fid_ref(device, fid);
+    if ( !fidp || !fidp->opened || fidp->fd < 0 )
+    {
+        if ( fidp )
+            free_fid(device, fidp);
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    e = datasync ? fdatasync(fidp->fd) : fsync(fidp->fd);
+    free_fid(device, fidp);
+
+    if ( e )
+        p9_error(ring, hdr->tag, errno);
+    else
+        fill_buffer(ring, P9_CMD_FSYNC + 1, hdr->tag, "");
+}
+
+/*
+ * TLOPEN (12): 9P2000.L open with a 32-bit mode.  Reply qid + iounit.
+ */
+static void p9_flopen(struct ring *ring, struct p9_header *hdr)
+{
+    device *device = ring->device;
+    uint32_t fid, mode;
+    struct p9_fid *fidp;
+    struct stat st;
+    struct p9_qid qid;
+    uint32_t iounit;
+    int ret;
+    int flags;
+
+    ret = fill_data(ring, "UU", &fid, &mode);
+    if ( ret != 2 )
+    {
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    fidp = get_fid_ref(device, fid);
+    if ( !fidp )
+    {
+        p9_error(ring, hdr->tag, EBADF);
+        return;
+    }
+
+    flags = open_flags_from_mode((uint8_t)(mode & 0xff));
+    if ( flags < 0 )
+    {
+        free_fid(device, fidp);
+        p9_error(ring, hdr->tag, EINVAL);
+        return;
+    }
+
+    pthread_mutex_lock(&device->fid_mutex);
+    fidp->fd = openat(device->root_fd, fidp->path, flags);
+    if ( fidp->fd < 0 )
+    {
+        int e = errno;
+        pthread_mutex_unlock(&device->fid_mutex);
+        free_fid(device, fidp);
+        p9_error(ring, hdr->tag, e);
+        return;
+    }
+    fidp->opened = true;
+    pthread_mutex_unlock(&device->fid_mutex);
+
+    if ( fstatat(device->root_fd, fidp->path, &st, 0) < 0 )
+    {
+        int e = errno;
+        free_fid(device, fidp);
+        p9_error(ring, hdr->tag, e);
+        return;
+    }
+
+    fill_qid(device, fidp->path, &qid, &st);
+    iounit = get_iounit(ring, &st);
+    free_fid(device, fidp);
+
+    fill_buffer(ring, P9_CMD_LOPEN + 1, hdr->tag, "QU", &qid, &iounit);
+}
+
 void *io_thread(void *arg)
 {
     struct ring *ring = arg;
@@ -1508,6 +2263,13 @@ void *io_thread(void *arg)
 
             ring->str_used = 0;
 
+            fprintf(stderr, "REQ %u.%u cmd=%u tag=%u size=%u\n",
+                    ring->device->domid, ring->device->devid, hdr.cmd,
+                    hdr.tag, hdr.size);
+            syslog(LOG_INFO, "REQ %u.%u cmd=%u tag=%u size=%u\n",
+                   ring->device->domid, ring->device->devid, hdr.cmd,
+                   hdr.tag, hdr.size);
+
             switch ( hdr.cmd )
             {
             case P9_CMD_VERSION:
@@ -1552,6 +2314,47 @@ void *io_thread(void *arg)
 
             case P9_CMD_FLUSH:
                 fill_buffer(ring, P9_CMD_FLUSH + 1, hdr.tag, "");
+                break;
+
+            /* 9P2000.u / 9P2000.L extension commands. */
+            case P9_CMD_STATFS:
+                p9_statfs(ring, &hdr);
+                break;
+
+            case P9_CMD_LOPEN:
+                p9_flopen(ring, &hdr);
+                break;
+
+            case P9_CMD_SYMLINK:
+                p9_symlink_op(ring, &hdr);
+                break;
+
+            case P9_CMD_RENAME:
+                p9_rename(ring, &hdr);
+                break;
+
+            case P9_CMD_FSYNC:
+                p9_fsync(ring, &hdr);
+                break;
+
+            case P9_CMD_MKDIR:
+                p9_mkdir(ring, &hdr);
+                break;
+
+            case P9_CMD_RENAMEAT:
+                p9_renameat(ring, &hdr);
+                break;
+
+            case P9_CMD_UNLINKAT:
+                p9_unlinkat(ring, &hdr);
+                break;
+
+            case P9_CMD_REMOVE:
+                p9_remove(ring, &hdr);
+                break;
+
+            case P9_CMD_TWSTAT:
+                p9_twstat(ring, &hdr);
                 break;
 
             default:

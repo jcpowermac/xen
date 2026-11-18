@@ -13,7 +13,12 @@
 
 #define MAX_RINGS                4
 #define MAX_RING_ORDER           9
-#define MAX_OPEN_FILES_DEFAULT   5
+/*
+ * Default cap on the per-device fid table.  The Linux 9P client allocates a
+ * fresh fid for every walk/clone, so a real workload needs far more than a
+ * handful; 5 caused spurious EMFILE under load.
+ */
+#define MAX_OPEN_FILES_DEFAULT   256
 
 struct p9_header {
     uint32_t size;

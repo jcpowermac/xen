@@ -252,3 +252,12 @@ tools/debugger/kdd/kdd
 tools/firmware/etherboot/ipxe.tar.gz
 tools/firmware/etherboot/ipxe/
 tools/xl/xl
+
+# 9pfsd local patched build + debug artifacts
+tools/9pfsd/xen-9pfsd-patched
+tools/9pfsd/9pfsd-restart.log
+tools/9pfsd/9pfsd.full
+tools/9pfsd/9pfsd.strace
+tools/9pfsd/9pfsd.wstrace
+# Xen build artifact (self-referential include symlink)
+xen/include/public/xen
